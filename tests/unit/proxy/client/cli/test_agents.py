@@ -27,6 +27,7 @@ from litellm.proxy.client.cli.commands.agents import (
     opencode_model_sync_env,
     run_agent,
     verify_proxy_key,
+    verify_subscription_key,
 )
 from litellm.proxy.client.cli.main import cli as lite
 
@@ -263,6 +264,55 @@ class TestBuildAgentEnv:
         assert env["PATH"] == "/usr/bin"
         assert base == {"PATH": "/usr/bin", "ANTHROPIC_API_KEY": "real-key"}
 
+    def test_subscription_sends_the_key_in_a_header_and_sets_no_credential(self):
+        env = build_agent_env({}, "http://localhost:4000/", "sk-key", frozenset({"anthropic"}), subscription=True)
+        assert env["ANTHROPIC_BASE_URL"] == "http://localhost:4000"
+        assert env["ANTHROPIC_CUSTOM_HEADERS"] == "x-litellm-api-key: Bearer sk-key"
+        assert "ANTHROPIC_AUTH_TOKEN" not in env
+        assert "ANTHROPIC_API_KEY" not in env
+
+    def test_subscription_clears_inherited_credentials(self):
+        base = {"ANTHROPIC_AUTH_TOKEN": "stale-token", "ANTHROPIC_API_KEY": "real-key"}
+        env = build_agent_env(base, "http://localhost:4000", "sk-key", frozenset({"anthropic"}), subscription=True)
+        assert "ANTHROPIC_AUTH_TOKEN" not in env
+        assert "ANTHROPIC_API_KEY" not in env
+        assert base == {"ANTHROPIC_AUTH_TOKEN": "stale-token", "ANTHROPIC_API_KEY": "real-key"}
+
+    def test_subscription_keeps_the_users_other_custom_headers(self):
+        env = build_agent_env(
+            {"ANTHROPIC_CUSTOM_HEADERS": "x-team: blue\n\nx-trace: 1\n"},
+            "http://localhost:4000",
+            "sk-key",
+            frozenset({"anthropic"}),
+            subscription=True,
+        )
+        assert env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
+            "x-team: blue",
+            "x-trace: 1",
+            "x-litellm-api-key: Bearer sk-key",
+        ]
+
+    def test_subscription_replaces_a_stale_litellm_key_header_whatever_its_case(self):
+        env = build_agent_env(
+            {"ANTHROPIC_CUSTOM_HEADERS": "X-LiteLLM-Api-Key: Bearer old\nx-team: blue"},
+            "http://localhost:4000",
+            "sk-new",
+            frozenset({"anthropic"}),
+            subscription=True,
+        )
+        assert env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == ["x-team: blue", "x-litellm-api-key: Bearer sk-new"]
+
+    def test_subscription_leaves_openai_agents_on_the_bearer_key(self):
+        env = build_agent_env({}, "http://localhost:4000", "sk-key", frozenset({"openai"}), subscription=True)
+        assert env["OPENAI_API_KEY"] == "sk-key"
+        assert "ANTHROPIC_CUSTOM_HEADERS" not in env
+
+    def test_default_mode_does_not_touch_custom_headers(self):
+        env = build_agent_env(
+            {"ANTHROPIC_CUSTOM_HEADERS": "x-team: blue"}, "http://localhost:4000", "sk-key", frozenset({"anthropic"})
+        )
+        assert env["ANTHROPIC_CUSTOM_HEADERS"] == "x-team: blue"
+
 
 class TestAgentLaunchArgs:
     def test_claude_and_opencode_get_no_extra_args(self):
@@ -329,6 +379,32 @@ class TestVerifyProxyKey:
             "sk-key",
             get=lambda *a, **k: _FakeResponse(500),
         )
+
+    def test_key_header_moves_the_bearer_off_authorization(self):
+        captured = {}
+
+        def fake_get(url, headers, timeout):
+            captured["headers"] = headers
+            return _FakeResponse(200)
+
+        verify_proxy_key("http://localhost:4000", "sk-key", get=fake_get, key_header="x-litellm-api-key")
+
+        assert captured["headers"] == {"x-litellm-api-key": "Bearer sk-key"}
+
+    def test_subscription_probe_sends_the_key_only_in_the_litellm_header(self):
+        captured = {}
+
+        def fake_get(url, headers, timeout):
+            captured["headers"] = headers
+            return _FakeResponse(200)
+
+        verify_subscription_key("http://localhost:4000", "sk-key", get=fake_get)
+
+        assert captured["headers"] == {"x-litellm-api-key": "Bearer sk-key"}
+
+    def test_subscription_probe_reports_a_rejected_key(self):
+        with pytest.raises(AgentRunError, match="rejected your key"):
+            verify_subscription_key("http://localhost:4000", "sk-key", get=lambda *a, **k: _FakeResponse(401))
 
 
 class TestOpencodeModelSync:
@@ -1195,6 +1271,199 @@ class TestRunAgent:
         with pytest.raises(AgentRunError):
             run_agent("http://localhost:4000", "sk-key", [])
 
+    def test_subscription_launch_probes_with_the_header_and_exports_it(self):
+        probed = []
+        launched = {}
+        run_agent(
+            "http://localhost:4000",
+            "sk-key",
+            ["claude"],
+            subscription=True,
+            base_env={"ANTHROPIC_AUTH_TOKEN": "stale"},
+            which=lambda name: "/usr/local/bin/claude",
+            verify=lambda *a: probed.append(("bearer", a)),
+            verify_subscription=lambda *a: probed.append(("header", a)),
+            launcher=lambda p, a, e: launched.update(env=dict(e)),
+            read_settings=lambda path: {},
+        )
+        assert probed == [("header", ("http://localhost:4000", "sk-key"))]
+        assert launched["env"]["ANTHROPIC_CUSTOM_HEADERS"] == "x-litellm-api-key: Bearer sk-key"
+        assert "ANTHROPIC_AUTH_TOKEN" not in launched["env"]
+
+    def test_subscription_launch_blanks_the_credentials_claude_code_would_load_from_settings_json(self):
+        launched = {}
+        run_agent(
+            "http://localhost:4000",
+            "sk-key",
+            ["claude", "--resume"],
+            subscription=True,
+            base_env={},
+            which=lambda name: "/usr/local/bin/claude",
+            verify_subscription=lambda *a: None,
+            launcher=lambda p, a, e: launched.update(args=tuple(a)),
+            read_settings=lambda path: {},
+        )
+        assert launched["args"][:2] == ("claude", "--settings")
+        assert json.loads(launched["args"][2]) == {
+            "env": {
+                "ANTHROPIC_AUTH_TOKEN": "",
+                "ANTHROPIC_API_KEY": "",
+                "ANTHROPIC_CUSTOM_HEADERS": "x-litellm-api-key: Bearer sk-key",
+            }
+        }
+        assert launched["args"][3:] == ("--resume",)
+
+    def test_subscription_launch_reads_the_settings_file_claude_code_will_read(self, tmp_path):
+        seen = []
+        run_agent(
+            "http://localhost:4000",
+            "sk-key",
+            ["claude"],
+            subscription=True,
+            base_env={"CLAUDE_CONFIG_DIR": str(tmp_path)},
+            which=lambda name: "/usr/local/bin/claude",
+            verify_subscription=lambda *a: None,
+            launcher=lambda *a: None,
+            read_settings=lambda path: seen.append(path) or {},
+        )
+        assert seen == [tmp_path / "settings.json"]
+
+    @pytest.mark.parametrize("separate_flag", [True, False])
+    def test_subscription_launch_merges_the_blanks_into_the_users_settings_flag(self, tmp_path, separate_flag):
+        settings_file = tmp_path / "mine.json"
+        settings_file.write_text('{"model": "opus", "env": {"ANTHROPIC_AUTH_TOKEN": "mine", "FOO": "bar"}}')
+        user_flag = ["--settings", str(settings_file)] if separate_flag else [f"--settings={settings_file}"]
+        launched = {}
+        run_agent(
+            "http://localhost:4000",
+            "sk-key",
+            ["claude", "--resume", *user_flag, "-p", "hi"],
+            subscription=True,
+            base_env={},
+            which=lambda name: "/usr/local/bin/claude",
+            verify_subscription=lambda *a: None,
+            launcher=lambda p, a, e: launched.update(args=list(a)),
+            read_settings=lambda path: {},
+        )
+        assert launched["args"][:2] == ["claude", "--settings"]
+        assert json.loads(launched["args"][2]) == {
+            "model": "opus",
+            "env": {
+                "ANTHROPIC_AUTH_TOKEN": "",
+                "FOO": "bar",
+                "ANTHROPIC_API_KEY": "",
+                "ANTHROPIC_CUSTOM_HEADERS": "x-litellm-api-key: Bearer sk-key",
+            },
+        }
+        assert launched["args"][3:] == ["--resume", "-p", "hi"]
+
+    def test_subscription_launch_merges_the_blanks_into_inline_settings_json(self):
+        launched = {}
+        run_agent(
+            "http://localhost:4000",
+            "sk-key",
+            ["claude", "--settings", '{"env": {"ANTHROPIC_API_KEY": "mine"}, "theme": "dark"}'],
+            subscription=True,
+            base_env={},
+            which=lambda name: "/usr/local/bin/claude",
+            verify_subscription=lambda *a: None,
+            launcher=lambda p, a, e: launched.update(args=list(a)),
+            read_settings=lambda path: {},
+        )
+        assert launched["args"][:2] == ["claude", "--settings"]
+        assert json.loads(launched["args"][2]) == {
+            "theme": "dark",
+            "env": {
+                "ANTHROPIC_API_KEY": "",
+                "ANTHROPIC_AUTH_TOKEN": "",
+                "ANTHROPIC_CUSTOM_HEADERS": "x-litellm-api-key: Bearer sk-key",
+            },
+        }
+        assert launched["args"][3:] == []
+
+    @pytest.mark.parametrize(
+        ("flag_headers", "file_headers", "process_headers", "expected"),
+        [
+            ("X-Flag: f", "X-File: g", "X-Proc: h", "X-Flag: f\nx-litellm-api-key: Bearer sk-key"),
+            (
+                None,
+                "X-File: g\nx-litellm-api-key: Bearer stale",
+                "X-Proc: h",
+                "X-File: g\nx-litellm-api-key: Bearer sk-key",
+            ),
+            (None, None, "X-Proc: h", "X-Proc: h\nx-litellm-api-key: Bearer sk-key"),
+        ],
+    )
+    def test_subscription_overlay_keeps_the_custom_headers_claude_code_would_apply_and_adds_the_key(
+        self, flag_headers, file_headers, process_headers, expected
+    ):
+        """Claude Code applies settings `env` over the process env, so the overlay must carry the headers too."""
+        user_flag = (
+            ["--settings", json.dumps({"env": {"ANTHROPIC_CUSTOM_HEADERS": flag_headers}})] if flag_headers else []
+        )
+        settings_file = {"env": {"ANTHROPIC_CUSTOM_HEADERS": file_headers}} if file_headers else {}
+        launched = {}
+        run_agent(
+            "http://localhost:4000",
+            "sk-key",
+            ["claude", *user_flag],
+            subscription=True,
+            base_env={"ANTHROPIC_CUSTOM_HEADERS": process_headers},
+            which=lambda name: "/usr/local/bin/claude",
+            verify_subscription=lambda *a: None,
+            launcher=lambda p, a, e: launched.update(args=list(a), env=dict(e)),
+            read_settings=lambda path: settings_file,
+        )
+        assert json.loads(launched["args"][2])["env"]["ANTHROPIC_CUSTOM_HEADERS"] == expected
+        assert launched["env"]["ANTHROPIC_CUSTOM_HEADERS"] == "X-Proc: h\nx-litellm-api-key: Bearer sk-key"
+
+    def test_subscription_launch_rejects_a_settings_flag_that_is_not_a_json_object(self):
+        with pytest.raises(AgentRunError, match="--settings"):
+            run_agent(
+                "http://localhost:4000",
+                "sk-key",
+                ["claude", "--settings", "[1, 2]"],
+                subscription=True,
+                base_env={},
+                which=lambda name: "/usr/local/bin/claude",
+                verify_subscription=lambda *a: None,
+                launcher=lambda *a: None,
+                read_settings=lambda path: {},
+            )
+
+    def test_default_launch_still_probes_with_the_bearer(self):
+        probed = []
+        run_agent(
+            "http://localhost:4000",
+            "sk-key",
+            ["claude"],
+            base_env={},
+            which=lambda name: "/usr/local/bin/claude",
+            verify=lambda *a: probed.append(("bearer", a)),
+            verify_subscription=lambda *a: probed.append(("header", a)),
+            launcher=lambda *a: None,
+        )
+        assert probed == [("bearer", ("http://localhost:4000", "sk-key"))]
+
+    def test_subscription_rejection_aborts_before_launch(self):
+        launched = []
+
+        def boom(*a):
+            raise AgentRunError("rejected")
+
+        with pytest.raises(AgentRunError):
+            run_agent(
+                "http://localhost:4000",
+                "sk-key",
+                ["claude"],
+                subscription=True,
+                base_env={},
+                which=lambda name: "/usr/local/bin/claude",
+                verify_subscription=boom,
+                launcher=lambda *a: launched.append(a),
+            )
+        assert launched == []
+
     def test_reattach_terminal_runs_just_before_launch(self):
         order = []
         run_agent(
@@ -1552,6 +1821,71 @@ class TestAgentCommands:
         assert captured["command"] == ["opencode"]
         assert "routing OpenCode through proxy at http://localhost:4000" in result.output
 
+    def test_claude_subscription_flag_reaches_run_agent_and_is_not_forwarded(self):
+        captured = {}
+
+        def fake_run_agent(base_url, api_key, command, **kwargs):
+            captured["command"] = list(command)
+            captured["subscription"] = kwargs.get("subscription")
+
+        with patch(f"{AGENTS_MODULE}.run_agent", side_effect=fake_run_agent):
+            result = self.runner.invoke(
+                _agent_command("claude"),
+                ["--subscription", "--resume"],
+                obj={"base_url": "http://localhost:4000", "api_key": "sk-key"},
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured["subscription"] is True
+        assert captured["command"] == ["claude", "--resume"]
+        assert "keeping your claude.ai login" in result.output
+
+    @pytest.mark.parametrize(
+        ("configured", "args", "expected"),
+        [
+            (False, [], False),
+            (True, [], True),
+            (True, ["--no-subscription"], False),
+            (False, ["--subscription"], True),
+        ],
+    )
+    def test_subscription_comes_from_the_flag_else_the_saved_setting(self, configured, args, expected):
+        captured = {}
+        with (
+            patch(f"{AGENTS_MODULE}.claude_subscription_default", return_value=configured),
+            patch(
+                f"{AGENTS_MODULE}.run_agent",
+                side_effect=lambda b, k, c, **kw: captured.update(sub=kw.get("subscription"), command=list(c)),
+            ),
+        ):
+            result = self.runner.invoke(
+                _agent_command("claude"), args, obj={"base_url": "http://localhost:4000", "api_key": "sk-key"}
+            )
+        assert result.exit_code == 0, result.output
+        assert captured["sub"] is expected
+        assert captured["command"] == ["claude"]
+        assert ("keeping your claude.ai login" in result.output) is expected
+
+    @pytest.mark.parametrize("agent", ["codex", "opencode"])
+    def test_the_saved_claude_setting_does_not_change_other_agents(self, agent):
+        captured = {}
+        with (
+            patch(f"{AGENTS_MODULE}.claude_subscription_default", return_value=True),
+            patch(
+                f"{AGENTS_MODULE}.run_agent",
+                side_effect=lambda b, k, c, **kw: captured.update(sub=kw.get("subscription")),
+            ),
+        ):
+            result = self.runner.invoke(
+                _agent_command(agent), [], obj={"base_url": "http://localhost:4000", "api_key": "sk-key"}
+            )
+        assert result.exit_code == 0, result.output
+        assert captured["sub"] is False
+
+    @pytest.mark.parametrize("agent", ["codex", "opencode", "pi"])
+    def test_only_claude_offers_the_subscription_flag(self, agent):
+        assert "--subscription" not in {opt for param in _agent_command(agent).params for opt in param.opts}
+
     def test_skip_verify_is_consumed_not_forwarded(self):
         captured = {}
 
@@ -1676,7 +2010,9 @@ class TestPrepareCodex:
     def test_registers_the_installed_script_as_a_session_scoped_stop_hook(self):
         from litellm.proxy.client.cli.commands.agents import prepare_codex
 
-        args = prepare_codex("http://localhost:4000", "sk-key", {}, install=lambda: "/py /home/me/.litellm/statusline.py")
+        args = prepare_codex(
+            "http://localhost:4000", "sk-key", {}, install=lambda: "/py /home/me/.litellm/statusline.py"
+        )
         assert args == (
             "-c",
             'hooks.Stop=[{hooks=[{type="command",command="/py /home/me/.litellm/statusline.py"}]}]',
@@ -1697,11 +2033,20 @@ class TestPrepareCodex:
 
         warnings = []
         env = {"CODEX_HOME": str(tmp_path)}
-        for body in ('[[hooks.Stop]]\nhooks = [{ type = "command", command = "mine" }]\n', 'hooks.Stop = []\n', "[hooks]\n"):
+        for body in (
+            '[[hooks.Stop]]\nhooks = [{ type = "command", command = "mine" }]\n',
+            "hooks.Stop = []\n",
+            "[hooks]\n",
+        ):
             (tmp_path / "config.toml").write_text(body)
-            assert prepare_codex("http://localhost:4000", "sk", env, install=lambda: "/py /s.py", warn=warnings.append) == ()
+            assert (
+                prepare_codex("http://localhost:4000", "sk", env, install=lambda: "/py /s.py", warn=warnings.append)
+                == ()
+            )
         (tmp_path / "config.toml").write_text('model = "gpt-5.6-sol"\n[projects."/x"]\ntrust_level = "trusted"\n')
-        assert prepare_codex("http://localhost:4000", "sk", env, install=lambda: "/py /s.py", warn=warnings.append) != ()
+        assert (
+            prepare_codex("http://localhost:4000", "sk", env, install=lambda: "/py /s.py", warn=warnings.append) != ()
+        )
         assert len(warnings) == 3 and "already declares hooks" in warnings[0]
 
     def test_a_config_that_cannot_be_read_or_decoded_still_lets_codex_launch(self, tmp_path):

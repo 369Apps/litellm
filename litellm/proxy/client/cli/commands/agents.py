@@ -9,11 +9,11 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Final, TypeAlias
+from typing import Final, TypeAlias, TypeVar
 
 import click
 import requests
-from pydantic import TypeAdapter, ValidationError
+from pydantic import JsonValue, TypeAdapter, ValidationError
 
 from litellm.proxy.common_utils.codex_model_catalog import (
     CODEX_BASE_INSTRUCTIONS_PATH,
@@ -25,8 +25,15 @@ from litellm.proxy.common_utils.codex_model_catalog import (
 from litellm.types.llms.base_model import LiteLLMBaseModel
 
 from .auth import cli_context_obj, context_secret_vault, get_stored_api_key, login
-from .claude_settings import ClaudeSettingsError, install_statusline_script
+from .claude_settings import (
+    ENV_KEY,
+    ClaudeSettingsError,
+    claude_settings_path,
+    install_statusline_script,
+    load_json_or_empty,
+)
 from .cmd_quoting import quote_for_cmd
+from .config import claude_subscription_default
 from .pi import (
     LITELLM_PROXY_API_KEY_ENV,
     PI_PROVIDER_NAME,
@@ -41,6 +48,8 @@ from .pi import (
 ANTHROPIC_BASE_URL_ENV: Final = "ANTHROPIC_BASE_URL"
 ANTHROPIC_AUTH_TOKEN_ENV: Final = "ANTHROPIC_AUTH_TOKEN"
 ANTHROPIC_API_KEY_ENV: Final = "ANTHROPIC_API_KEY"
+ANTHROPIC_CUSTOM_HEADERS_ENV: Final = "ANTHROPIC_CUSTOM_HEADERS"
+LITELLM_KEY_HEADER: Final = "x-litellm-api-key"
 ENABLE_TOOL_SEARCH_ENV: Final = "ENABLE_TOOL_SEARCH"
 ENABLE_TOOL_SEARCH_VALUE: Final = "true"
 ENABLE_GATEWAY_MODEL_DISCOVERY_ENV: Final = "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"
@@ -73,6 +82,7 @@ _INSTALL_DOCS: Final[dict[str, str]] = {
 }
 
 _HIDDEN_AGENTS: Final = frozenset({"pi"})
+_SUBSCRIPTION_AGENTS: Final = frozenset({"claude"})
 
 CODEX_PROXY_PROVIDER: Final = "litellm"
 CODEX_HOME_ENV: Final = "CODEX_HOME"
@@ -96,11 +106,24 @@ def agent_profile(command: str) -> tuple[str, frozenset[str]]:
     return base, frozenset({PROFILE_ANTHROPIC, PROFILE_OPENAI})
 
 
+def _custom_headers_with_litellm_key(existing: str, api_key: str) -> str:
+    kept: Final = tuple(
+        line for line in existing.splitlines() if line.strip() and not _is_header_line(line, LITELLM_KEY_HEADER)
+    )
+    return "\n".join((*kept, f"{LITELLM_KEY_HEADER}: Bearer {api_key}"))
+
+
+def _is_header_line(line: str, name: str) -> bool:
+    return line.partition(":")[0].strip().lower() == name
+
+
 def build_agent_env(
     base_env: Mapping[str, str],
     base_url: str,
     api_key: str,
     profiles: frozenset[str],
+    *,
+    subscription: bool = False,
 ) -> dict[str, str]:
     """Return a copy of base_env wired to route the agent through the proxy.
 
@@ -115,12 +138,22 @@ def build_agent_env(
     proxy's /v1/models; likewise left alone when already set.
     pi ignores both base URL variables and instead resolves $LITELLM_PROXY_API_KEY
     from its synced models.json provider entry.
+    With subscription=True the Anthropic profile keeps Claude Code on its claude.ai login: the key
+    travels in the x-litellm-api-key header through ANTHROPIC_CUSTOM_HEADERS, and no
+    ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY is left in the environment, since either one makes
+    Claude Code stop using the subscription (and its connectors).
     """
     env: Final = dict(base_env)
     root: Final = base_url.rstrip("/")
     if PROFILE_ANTHROPIC in profiles:
         env[ANTHROPIC_BASE_URL_ENV] = root
-        env[ANTHROPIC_AUTH_TOKEN_ENV] = api_key
+        if subscription:
+            env[ANTHROPIC_CUSTOM_HEADERS_ENV] = _custom_headers_with_litellm_key(
+                env.get(ANTHROPIC_CUSTOM_HEADERS_ENV, ""), api_key
+            )
+            env.pop(ANTHROPIC_AUTH_TOKEN_ENV, None)
+        else:
+            env[ANTHROPIC_AUTH_TOKEN_ENV] = api_key
         env.pop(ANTHROPIC_API_KEY_ENV, None)
         if ENABLE_TOOL_SEARCH_ENV not in env:
             env[ENABLE_TOOL_SEARCH_ENV] = ENABLE_TOOL_SEARCH_VALUE
@@ -144,6 +177,78 @@ def codex_proxy_provider(base_url: str) -> Mapping[str, str | bool]:
             "requires_openai_auth": False,
         }
     )
+
+
+_SETTINGS_FLAG: Final = "--settings"
+_SUBSCRIPTION_SETTINGS_ENV: Final = MappingProxyType({ANTHROPIC_AUTH_TOKEN_ENV: "", ANTHROPIC_API_KEY_ENV: ""})
+_SETTINGS_OVERRIDE_ADAPTER: Final = TypeAdapter(dict[str, JsonValue])
+
+
+def _user_settings_flag(args: Sequence[str]) -> int | None:
+    return next(
+        (i for i, arg in enumerate(args) if arg == _SETTINGS_FLAG or arg.startswith(_SETTINGS_FLAG + "=")), None
+    )
+
+
+def _load_settings_override(value: str) -> Mapping[str, JsonValue]:
+    path: Final = Path(value).expanduser()
+    if path.is_file():
+        try:
+            return load_json_or_empty(path)
+        except ClaudeSettingsError as e:
+            raise AgentRunError(str(e)) from e
+    try:
+        return _SETTINGS_OVERRIDE_ADAPTER.validate_json(value)
+    except ValidationError as e:
+        raise AgentRunError(f"`{_SETTINGS_FLAG}` must be a settings file or a JSON object, got: {value}") from e
+
+
+def _settings_env(settings: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
+    env: Final = settings.get(ENV_KEY)
+    return env if isinstance(env, dict) else {}
+
+
+def _settings_json(base: Mapping[str, JsonValue], api_key: str, inherited_headers: str) -> str:
+    base_env: Final = _settings_env(base)
+    own_headers: Final = base_env.get(ANTHROPIC_CUSTOM_HEADERS_ENV)
+    headers: Final = _custom_headers_with_litellm_key(
+        own_headers if isinstance(own_headers, str) else inherited_headers, api_key
+    )
+    overlay: Final = {**base_env, **_SUBSCRIPTION_SETTINGS_ENV, ANTHROPIC_CUSTOM_HEADERS_ENV: headers}
+    return json.dumps({**base, ENV_KEY: overlay}, separators=(",", ":"))
+
+
+def _inherited_custom_headers(settings_file: Mapping[str, JsonValue], environ: Mapping[str, str]) -> str:
+    from_file: Final = _settings_env(settings_file).get(ANTHROPIC_CUSTOM_HEADERS_ENV)
+    return from_file if isinstance(from_file, str) else environ.get(ANTHROPIC_CUSTOM_HEADERS_ENV, "")
+
+
+def subscription_launch_args(
+    command: Sequence[str],
+    api_key: str,
+    environ: Mapping[str, str],
+    settings_file: Mapping[str, JsonValue],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The `--settings` that keeps Claude Code on its claude.ai login, plus the user's remaining args.
+
+    Claude Code applies `env` from settings.json over the process environment, so a key that `lite up` or
+    `lite configure claude` left in ANTHROPIC_AUTH_TOKEN would land back in `Authorization`, and an
+    ANTHROPIC_CUSTOM_HEADERS there would drop the x-litellm-api-key header. The overlay blanks both credential
+    keys (read as unset for this session only) and carries the custom headers with the LiteLLM key appended,
+    taking the headers from the user's `--settings`, else their settings file, else the process environment.
+    A `--settings` the user passed (inline JSON or a file) is merged in, since Claude Code keeps only the last one.
+    """
+    user_args: Final = tuple(command[1:])
+    inherited: Final = _inherited_custom_headers(settings_file, environ)
+    flag_index: Final = _user_settings_flag(user_args)
+    if flag_index is None:
+        return (_SETTINGS_FLAG, _settings_json({}, api_key, inherited)), user_args
+    flag: Final = user_args[flag_index]
+    inline: Final = flag.partition("=")[2] if flag != _SETTINGS_FLAG else None
+    value: Final = inline if inline is not None else "".join(user_args[flag_index + 1 : flag_index + 2])
+    consumed: Final = 1 if inline is not None else 2
+    rest: Final = (*user_args[:flag_index], *user_args[flag_index + consumed :])
+    return (_SETTINGS_FLAG, _settings_json(_load_settings_override(value), api_key, inherited)), rest
 
 
 def _codex_proxy_args(base_url: str) -> list[str]:
@@ -570,6 +675,7 @@ def verify_proxy_key(
     api_key: str,
     *,
     get: Callable[..., requests.Response] = requests.get,
+    key_header: str = "Authorization",
 ) -> None:
     """Probe the proxy with the key so bad creds fail here, not inside the agent.
 
@@ -578,7 +684,7 @@ def verify_proxy_key(
     """
     url: Final = base_url.rstrip("/") + "/v1/models"
     try:
-        resp: Final = get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=10)
+        resp: Final = get(url, headers={key_header: f"Bearer {api_key}"}, timeout=10)
     except requests.RequestException as e:
         raise AgentRunError(
             f"Could not reach the LiteLLM proxy at {base_url.rstrip('/')}: {e}. "
@@ -589,6 +695,15 @@ def verify_proxy_key(
             f"LiteLLM rejected your key (HTTP {resp.status_code}). "
             "Run `lite login` to refresh it, or pass a valid --api-key."
         )
+
+
+def verify_subscription_key(
+    base_url: str,
+    api_key: str,
+    *,
+    get: Callable[..., requests.Response] = requests.get,
+) -> None:
+    verify_proxy_key(base_url, api_key, get=get, key_header=LITELLM_KEY_HEADER)
 
 
 _WINDOWS_SHIM_SUFFIXES: Final[frozenset[str]] = frozenset({".cmd", ".bat"})
@@ -686,14 +801,17 @@ def run_agent(
     command: Sequence[str],
     *,
     skip_verify: bool = False,
+    subscription: bool = False,
     base_env: Mapping[str, str] | None = None,
     which: Callable[[str], str | None] = shutil.which,
     verify: Callable[[str, str], None] = verify_proxy_key,
+    verify_subscription: Callable[[str, str], None] = verify_subscription_key,
     sync_models: Callable[[str, Mapping[str, str], str, str, bool], ModelSyncResult] = agent_model_sync_env,
     warn: Callable[[str], None] = _warn,
     launcher: Callable[[str, Sequence[str], Mapping[str, str]], None] = _hand_off,
     reattach_terminal: Callable[[], None] | None = None,
     preparers: Mapping[str, _Preparer] = MappingProxyType(_PREPARERS),
+    read_settings: Callable[[Path], Mapping[str, JsonValue]] = load_json_or_empty,
 ) -> None:
     """Validate, wire the environment, and hand off to the agent.
 
@@ -713,7 +831,7 @@ def run_agent(
         raise AgentRunError(f"Could not find `{command[0]}` on your PATH.{hint}")
 
     if not skip_verify:
-        verify(base_url, api_key)
+        (verify_subscription if subscription else verify)(base_url, api_key)
 
     env_before_sync: Final = base_env if base_env is not None else os.environ
     synced: Final = sync_models(binary, env_before_sync, base_url, api_key, skip_verify)
@@ -725,15 +843,22 @@ def run_agent(
 
     env: Final = MappingProxyType(
         {
-            **build_agent_env(env_before_sync, base_url, api_key, profiles),
+            **build_agent_env(env_before_sync, base_url, api_key, profiles, subscription=subscription),
             **(synced if isinstance(synced, Mapping) else _NO_EXTRA_ENV),
         }
     )
     synced_args: Final = synced.args if isinstance(synced, ModelSyncArgs) else ()
     extra_args: Final = (*agent_launch_args(command[0], base_url), *synced_args, *prepared_args)
+    settings_args, forwarded = (
+        subscription_launch_args(
+            command, api_key, env_before_sync, read_settings(claude_settings_path(env_before_sync))
+        )
+        if subscription and os.path.basename(command[0]) in _SUBSCRIPTION_AGENTS
+        else ((), tuple(command[1:]))
+    )
     if reattach_terminal is not None:
         reattach_terminal()
-    launcher(binary, [command[0], *extra_args, *command[1:]], env)
+    launcher(binary, [command[0], *extra_args, *settings_args, *forwarded], env)
 
 
 def _is_interactive() -> bool:
@@ -762,16 +887,27 @@ def resolve_api_key(ctx: click.Context) -> str:
 
 
 _SKIP_VERIFY_HELP: Final = "Skip the pre-launch key check against the proxy."
+_SUBSCRIPTION_HELP: Final = (
+    "Keep using your claude.ai login (and its connectors). The LiteLLM key is sent in the "
+    "x-litellm-api-key header instead of replacing Claude Code's own credential. "
+    "Make it the default with `lite config set claude_subscription true`."
+)
 
 
-def _launch(ctx: click.Context, binary: str, args: Sequence[str], *, skip_verify: bool) -> None:
+def _launch(
+    ctx: click.Context, binary: str, args: Sequence[str], *, skip_verify: bool, subscription: bool | None = None
+) -> None:
     ctx_obj: Final = cli_context_obj(ctx)
     base_url: Final = ctx_obj["base_url"]
     started_interactive: Final = _is_interactive()
     api_key: Final = resolve_api_key(ctx)
 
     display_name, _profiles = agent_profile(binary)
-    click.echo(f"litellm: routing {display_name} through proxy at {base_url.rstrip('/')}")
+    use_subscription: Final = (
+        subscription if subscription is not None else binary in _SUBSCRIPTION_AGENTS and claude_subscription_default()
+    )
+    login_note: Final = " (keeping your claude.ai login)" if use_subscription else ""
+    click.echo(f"litellm: routing {display_name} through proxy at {base_url.rstrip('/')}{login_note}")
 
     try:
         run_agent(
@@ -779,10 +915,20 @@ def _launch(ctx: click.Context, binary: str, args: Sequence[str], *, skip_verify
             api_key,
             [binary, *args],
             skip_verify=skip_verify,
+            subscription=use_subscription,
             reattach_terminal=(_restore_controlling_terminal if started_interactive else None),
         )
     except AgentRunError as e:
         raise click.ClickException(str(e))
+
+
+_Decorated: Final = TypeVar("_Decorated", bound=Callable[..., object] | click.Command)
+
+
+def _subscription_option(binary: str) -> Callable[[_Decorated], _Decorated]:
+    if binary not in _SUBSCRIPTION_AGENTS:
+        return lambda func: func
+    return click.option("--subscription/--no-subscription", default=None, help=_SUBSCRIPTION_HELP)
 
 
 def _make_agent_command(binary: str, display_name: str) -> click.Command:
@@ -793,10 +939,11 @@ def _make_agent_command(binary: str, display_name: str) -> click.Command:
         hidden=binary in _HIDDEN_AGENTS,
     )
     @click.option("--skip-verify", is_flag=True, default=False, help=_SKIP_VERIFY_HELP)
+    @_subscription_option(binary)
     @click.argument("args", nargs=-1, type=click.UNPROCESSED)
     @click.pass_context
-    def _command(ctx: click.Context, skip_verify: bool, args: Sequence[str]) -> None:
-        _launch(ctx, binary, list(args), skip_verify=skip_verify)
+    def _command(ctx: click.Context, skip_verify: bool, args: Sequence[str], subscription: bool | None = None) -> None:
+        _launch(ctx, binary, list(args), skip_verify=skip_verify, subscription=subscription)
 
     _command.help = (
         f"Run {display_name} routed through your LiteLLM proxy.\n\n"
@@ -826,5 +973,7 @@ __all__ = [
     "prepare_pi",
     "resolve_api_key",
     "run_agent",
+    "subscription_launch_args",
     "verify_proxy_key",
+    "verify_subscription_key",
 ]
